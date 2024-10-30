@@ -17,7 +17,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Initialize VADER sentiment analyzer
 analyzer = SentimentIntensityAnalyzer()
-stock_summaries = {stock: {"mentions": [], "score": 0} for stock in NSE_500_stocks}
+
 
 def analyze_sentiment(news_text):
     if news_text.strip():
@@ -63,7 +63,7 @@ async def process_news(url, stock_mentions, driver):
 
         # Limit nested page fetching to 10
         tasks = []
-        for news_url in news_links[:30]:
+        for news_url in news_links[:30]:  # Take only the first 30 links
             tasks.append(fetch_and_analyze(news_url, stock_mentions, driver))
 
         await asyncio.gather(*tasks)  # Run all sentiment analysis tasks concurrently
@@ -89,8 +89,6 @@ async def fetch_and_analyze(news_url, stock_mentions, driver):
     if sentiment_label:
         for stock in NSE_500_stocks:
             if stock in news_text:
-                stock_summaries[stock]["mentions"].append(
-                    news_text)  # Store the news text for summary# Take only the first 30 links
                 if sentiment_label == "positive":
                     stock_mentions[stock]["score"] += 1
                 elif sentiment_label == "negative":
@@ -99,33 +97,25 @@ async def fetch_and_analyze(news_url, stock_mentions, driver):
     driver.close()  # Close the tab after processing
     driver.switch_to.window(driver.window_handles[0])  # Switch back to the original window
 
-async def summarize_stock_news(stock_summaries):
-    for stock, data in stock_summaries.items():
-        if data["mentions"]:
-            # Create a summary by joining the mentions
-            summary = " ".join(data["mentions"])
-            print(f"Summary for {stock}:")
-            print(summary)
-            print(f"Sentiment Score: {data['score']}\n")
 
 async def scrape_news(urls):
+    stock_mentions = {stock: {"score": 0} for stock in NSE_500_stocks}
+
+    # Set up the Chrome driver
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")  # Run headless
+    chrome_options.add_argument("--no-sandbox")  # Bypass OS security model
+    chrome_options.add_argument("--disable-dev-shm-usage")  # Overcome limited resource problems
+    chrome_options.add_argument("--window-size=1920x1080")  # Set the window size
+    chrome_options.add_argument("--disable-extensions")  # Disable extensions to improve performance
+    service = ChromeService(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+
     try:
         while True:
-            stock_mentions = {stock: {"score": 0} for stock in NSE_500_stocks}
-            stock_summaries = {stock: {"mentions": [], "score": 0} for stock in NSE_500_stocks}
-            # Set up the Chrome driver
-            chrome_options = Options()
-            chrome_options.add_argument("--headless")  # Run headless
-            chrome_options.add_argument("--no-sandbox")  # Bypass OS security model
-            chrome_options.add_argument("--disable-dev-shm-usage")  # Overcome limited resource problems
-            chrome_options.add_argument("--window-size=1920x1080")  # Set the window size
-            chrome_options.add_argument("--disable-extensions")  # Disable extensions to improve performance
-            service = ChromeService(ChromeDriverManager().install())
-            driver = webdriver.Chrome(service=service, options=chrome_options)
             await asyncio.gather(*[process_news(url, stock_mentions, driver) for url in urls])
-            print_results(stock_mentions)
-            summarize_stock_news(stock_summaries)# Display the results
-            #await asyncio.sleep(120)  # Sleep for 2 minutes
+            print_results(stock_mentions)  # Display the results
+            await asyncio.sleep(120)  # Sleep for 2 minutes
     finally:
         driver.quit()  # Close the browser after processing
 
