@@ -1,16 +1,15 @@
 import os
 import asyncio
+import random
+import time
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
 from bs4 import BeautifulSoup
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-import random
-import time
 from concurrent.futures import ThreadPoolExecutor
-
-from Stocks import NSE_500_stocks
+from Stocks import NSE_100_stocks
 
 # Set environment variable to disable parallelism warning
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -21,38 +20,32 @@ analyzer = SentimentIntensityAnalyzer()
 
 def analyze_sentiment(news_text):
     if news_text.strip():
-        try:
-            sentiment = analyzer.polarity_scores(news_text)
-            if sentiment['compound'] >= 0.05:
-                return 'positive'
-            elif sentiment['compound'] <= -0.05:
-                return 'negative'
-            else:
-                return 'neutral'
-        except Exception as e:
-            print(f"Error during sentiment analysis: {e}")
-            return None
+        sentiment = analyzer.polarity_scores(news_text)
+        if sentiment['compound'] >= 0.05:
+            return 'positive'
+        elif sentiment['compound'] <= -0.05:
+            return 'negative'
+        else:
+            return 'neutral'
     return None
 
 
 async def fetch_page(url, driver):
     try:
         driver.get(url)
-        time.sleep(random.uniform(1, 2))  # Shorter wait time
-        html = driver.page_source
-        return html
+        await asyncio.sleep(random.uniform(2, 3))  # Wait for page to load
+        return driver.page_source
     except Exception as e:
         print(f"Error fetching {url}: {e}")
         return None
 
 
 def extract_news_links(soup):
-    """Extract news links."""
     news_links = []
     for a in soup.find_all("a", href=True):
-        if "article" in a['href']:  # Modify condition based on site structure
+        if "article" in a['href'] or "news" in a['href']:
             news_links.append(a['href'])
-    return news_links
+    return list(set(news_links))  # Remove duplicates
 
 
 async def process_news(url, stock_mentions, driver):
@@ -61,86 +54,106 @@ async def process_news(url, stock_mentions, driver):
         soup = BeautifulSoup(html, "lxml")
         news_links = extract_news_links(soup)
 
-        # Limit nested page fetching to 10
-        tasks = []
-        for news_url in news_links[:30]:  # Take only the first 30 links
-            tasks.append(fetch_and_analyze(news_url, stock_mentions, driver))
-
-        await asyncio.gather(*tasks)  # Run all sentiment analysis tasks concurrently
+        tasks = [fetch_and_analyze(news_url, stock_mentions, driver) for news_url in news_links[:30]]
+        await asyncio.gather(*tasks)
 
 
 async def fetch_and_analyze(news_url, stock_mentions, driver):
-    """Fetch news article and analyze its sentiment."""
-    driver.execute_script("window.open(arguments[0]);", news_url)  # Open in a new tab
-    driver.switch_to.window(driver.window_handles[-1])  # Switch to the new tab
-    time.sleep(random.uniform(1, 2))  # Short wait for loading
+    try:
+        driver.execute_script("window.open(arguments[0]);", news_url)
+        driver.switch_to.window(driver.window_handles[-1])
+        await asyncio.sleep(random.uniform(2, 3))
 
-    news_html = driver.page_source
-    news_soup = BeautifulSoup(news_html, "lxml")
-    news_text = " ".join(p.text for p in news_soup.find_all("p"))
+        news_html = driver.page_source
+        news_soup = BeautifulSoup(news_html, "lxml")
 
-    if news_text and len(news_text) > 512:
-        news_text = news_text[:512]
+        # Improved headline extraction
+        headline = news_soup.find('h1')
+        if headline is None:
+            headline = news_soup.find('title')  # Fallback to <title> tag
+        headline_text = headline.text.strip() if headline else "No headline found"
+        print(f"Processing headline: {headline_text}")
 
-    # Perform sentiment analysis in a separate thread
-    sentiment_label = await asyncio.get_event_loop().run_in_executor(ThreadPoolExecutor(), analyze_sentiment, news_text)
+        # Extract article content
+        paragraphs = news_soup.find_all("p")
+        news_text = " ".join(p.text for p in paragraphs if p.text).strip()
 
-    # Check if sentiment analysis returned a label
-    if sentiment_label:
-        for stock in NSE_500_stocks:
-            if stock in news_text:
-                if sentiment_label == "positive":
-                    stock_mentions[stock]["score"] += 1
-                elif sentiment_label == "negative":
-                    stock_mentions[stock]["score"] -= 1
+        # Check if news text is too short
+        if len(news_text) < 50:  # Skip if too short
+            print(f"Skipping analysis for {news_url}: content too short.")
+            return
 
-    driver.close()  # Close the tab after processing
-    driver.switch_to.window(driver.window_handles[0])  # Switch back to the original window
+        if news_text and len(news_text) > 512:
+            news_text = news_text[:512]
 
+        print(f"Analyzing text: {news_text}")
+
+        # Perform sentiment analysis in a thread pool
+        sentiment_label = await asyncio.get_event_loop().run_in_executor(ThreadPoolExecutor(), analyze_sentiment, news_text)
+
+        if sentiment_label:
+            for stock in NSE_100_stocks:
+                if stock in news_text:
+                    if sentiment_label == "positive":
+                        stock_mentions[stock]["score"] += 1
+                        stock_mentions[stock]["headlines"].append(headline_text)
+                    elif sentiment_label == "negative":
+                        stock_mentions[stock]["score"] -= 1
+                        stock_mentions[stock]["headlines"].append(headline_text)
+        else:
+            print(f"No sentiment detected for {news_url}.")
+
+    except Exception as e:
+        print(f"Error processing {news_url}: {e}")
+    finally:
+        driver.close()
+        driver.switch_to.window(driver.window_handles[0])
 
 async def scrape_news(urls):
-    stock_mentions = {stock: {"score": 0} for stock in NSE_500_stocks}
+    stock_mentions = {stock: {"score": 0, "headlines": []} for stock in NSE_100_stocks}
 
-    # Set up the Chrome driver
     chrome_options = Options()
-    chrome_options.add_argument("--headless")  # Run headless
-    chrome_options.add_argument("--no-sandbox")  # Bypass OS security model
-    chrome_options.add_argument("--disable-dev-shm-usage")  # Overcome limited resource problems
-    chrome_options.add_argument("--window-size=1920x1080")  # Set the window size
-    chrome_options.add_argument("--disable-extensions")  # Disable extensions to improve performance
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--window-size=1920x1080")
+    chrome_options.add_argument("--disable-extensions")
+
     service = ChromeService(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=chrome_options)
 
     try:
-        while True:
-            await asyncio.gather(*[process_news(url, stock_mentions, driver) for url in urls])
-            print_results(stock_mentions)  # Display the results
-            await asyncio.sleep(120)  # Sleep for 2 minutes
+        await asyncio.gather(*(process_news(url, stock_mentions, driver) for url in urls))
+        print_results(stock_mentions)
     finally:
-        driver.quit()  # Close the browser after processing
+        driver.quit()
+
 
 def print_results(stock_mentions):
-    top_positive = {stock: data["score"] for stock, data in stock_mentions.items() if data["score"] > 1}
-    top_negative = {stock: data["score"] for stock, data in stock_mentions.items() if data["score"] < -1}
+    top_positive = {stock: data for stock, data in stock_mentions.items() if data["score"] > 0}
+    top_negative = {stock: data for stock, data in stock_mentions.items() if data["score"] < 0}
 
     print("\nTop Positive Stocks:")
-    for stock, score in top_positive.items():
-        print(f"{stock}: {score} score")
+    if top_positive:
+        for stock, data in top_positive.items():
+            print(f"{stock}: {data['score']} score, Headlines: {data['headlines']}")
+    else:
+        print("No positive stocks found.")
 
     print("\nTop Negative Stocks:")
-    for stock, score in top_negative.items():
-        print(f"{stock}: {score} score")
+    if top_negative:
+        for stock, data in top_negative.items():
+            print(f"{stock}: {data['score']} score, Headlines: {data['headlines']}")
+    else:
+        print("No negative stocks found.")
+
 
 # Example URLs (replace with actual news URLs)
 urls = [
-    "https://pulse.zerodha.com/",
-    "https://www.business-standard.com/markets",
-    "https://www.moneycontrol.com/news/business/stocks/",
     "https://economictimes.indiatimes.com/markets/stocks?from=mdr",
     "https://www.livemint.com/market",
-    "https://www.bqprime.com/markets",
-    "https://www.tradingview.com/news/",
-    "https://www.benzinga.com/",
+    "https://www.ndtvprofit.com/markets?src=topnav"
+    "https://pulse.zerodha.com/"
 ]
 
 if __name__ == "__main__":
